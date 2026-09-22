@@ -1,0 +1,27 @@
+services:
+  proof-chain-api:
+    build: .
+    image: supply-chain-proof-chain:latest
+    container_name: proof-chain-api
+    ports:
+      - "8080:8080"
+    environment:
+      # SQLite 数据库文件位置 (容器内), 持久化到命名卷
+      DATABASE_PATH: /data/proofs.db
+      MAX_CHAIN_DEPTH: "256"
+      # 受信任的根签发者公钥, Base64 Ed25519 公钥, 多个用逗号分隔。
+      # 留空 = 开发模式: 任意自签名根均被接受 (生产环境务必配置!)。
+      # 生成方式见 README “信任根” 一节。示例:
+      # TRUSTED_ROOT_ISSUERS: "MCowBQYDK2VwAyEAxxxxxx..."
+      TRUSTED_ROOT_ISSUERS: ""
+    volumes:
+      - proof-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health').read()"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  proof-data:
