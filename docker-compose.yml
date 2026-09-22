@@ -6,12 +6,15 @@ services:
     ports:
       - "8080:8080"
     environment:
-      # SQLite 数据库文件位置 (容器内), 持久化到命名卷
+      # SQLite 数据库文件位置 (容器内), 持久化到命名卷。
+      # 信任根版本 (POST /trust-roots) 同样存放在该库中, 随卷持久化。
       DATABASE_PATH: /data/proofs.db
       MAX_CHAIN_DEPTH: "256"
-      # 受信任的根签发者公钥, Base64 Ed25519 公钥, 多个用逗号分隔。
+      # 初始受信任根签发者公钥, Base64 Ed25519, 多个用逗号分隔。
       # 留空 = 开发模式: 任意自签名根均被接受 (生产环境务必配置!)。
-      # 生成方式见 README “信任根” 一节。示例:
+      # 通过 POST /trust-roots 创建并 PUT /trust-roots/{name}/activate
+      # 激活信任根版本后, 校验优先使用激活版本; 在创建任何版本之前,
+      # 始终回退到本变量。生成方式见 README “信任根” 一节。示例:
       # TRUSTED_ROOT_ISSUERS: "MCowBQYDK2VwAyEAxxxxxx..."
       TRUSTED_ROOT_ISSUERS: ""
     volumes:

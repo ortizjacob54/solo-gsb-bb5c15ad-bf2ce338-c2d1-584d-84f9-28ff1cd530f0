@@ -7,7 +7,8 @@
 - 同一制品出现**分叉**（多条不同证明）或链上存在**被撤销祖先**时，返回带有序节点的 **可定位失败路径**
 - 校验成功时返回**有序信任链**（target → … → root）
 - 支持 `?at=<RFC3339 UTC>` **历史时点校验**：只基于该时点已可见的证明与已生效的撤销求值，晚到分叉/后续撤销不改变更早时点的结论
-- 提供记录写入、制品校验、撤销、记录查询接口
+- **信任根版本管理**：创建带唯一名称、Ed25519 公钥集合与说明的**不可变版本**，原子切换当前激活版本；校验可固定到指定版本
+- 提供记录写入、制品校验、撤销、记录查询、信任根版本管理接口
 - Dockerfile + Docker Compose 一键启动，SQLite 数据持久化到命名卷
 
 ## 1. 快速启动
@@ -62,7 +63,13 @@ BASE_URL=http://localhost:8080 python3 demo/demo.py
   PARENT:<len>:<parent_digest 或空串>
   ```
 
-- **信任根**：根证明的 `parent_digest` 为空。根的 `issuer` 必须在 `TRUSTED_ROOT_ISSUERS` 环境变量中（多个公钥用逗号分隔）。**该变量留空时为开发模式：任意自签名根均被接受，生产环境务必配置。**
+- **信任根**：根证明的 `parent_digest` 为空。根的 `issuer` 必须在“当前信任根集合”中。信任根集合的来源按以下优先级解析：
+
+  1. 校验请求显式指定 `?root_version=<name>`：固定使用该**不可变版本**的公钥集合（未知版本返回 `400`），不随激活状态改变；
+  2. 否则若已通过 `PUT /trust-roots/{name}/activate` 激活了某个版本：使用该激活版本的公钥集合；
+  3. 否则回退到 `TRUSTED_ROOT_ISSUERS` 环境变量（多个公钥逗号分隔）。**该变量也未配置时为开发模式：任意自签名根均被接受，生产环境务必配置。**
+
+  即“未配置任何版本时保持现有 `TRUSTED_ROOT_ISSUERS` 行为”，版本接口只是叠加在其上的可轮换、可固定的信任根管理层。版本创建后不可变，切换通过单行原子更新完成；并发切换或校验时，读取方只会看到某一版本的完整公钥集合，不会读到半套公钥。
 
 生成信任根密钥对（Python）：
 
@@ -81,10 +88,13 @@ print(encode_public_key(priv.public_key()))   # 填入 docker-compose.yml 的 TR
 | --- | --- | --- |
 | `POST` | `/proofs` | 写入一条证明记录（内容完全相同的重复提交幂等去重，返回 `200`） |
 | `GET` | `/proofs/artifact/{artifact_digest}` | 列出某制品的全部证明记录 |
-| `GET` | `/verify/{artifact_digest}` | 递归校验完整证明链；可选 `?at=<RFC3339 UTC>` 做历史时点校验 |
+| `GET` | `/verify/{artifact_digest}` | 递归校验完整证明链；可选 `?at=<RFC3339 UTC>` 历史时点校验、`?root_version=<name>` 固定信任根版本 |
 | `POST` | `/revocations` | 撤销一个制品（幂等，已撤销返回 `200`） |
 | `GET` | `/revocations` | 列出全部撤销记录 |
 | `GET` | `/revocations/{artifact_digest}` | 查询单个制品撤销状态 |
+| `POST` | `/trust-roots` | 创建不可变的信任根版本（唯一名称 + Ed25519 公钥集合 + 说明） |
+| `GET` | `/trust-roots` | 列出全部版本及其激活状态 |
+| `PUT` | `/trust-roots/{name}/activate` | 原子切换当前激活的信任根版本 |
 | `GET` | `/health` | 健康检查 |
 
 ### 3.1 写入证明 `POST /proofs`
@@ -125,7 +135,7 @@ print(encode_public_key(priv.public_key()))   # 填入 docker-compose.yml 的 TR
 - `REVOKED`：目标或祖先被撤销。路径末节点 `relation` 为 `revoked`（目标自身）或 `revoked_ancestor`（祖先），并携带 `revocation` 详情（原因、时间）。
 - `INVALID_SIGNATURE`：Ed25519 签名验证失败。
 - `MISSING_PARENT`：父制品没有任何证明记录，`failure.missing_artifact` 指明缺失节点。
-- `UNTRUSTED_ROOT`：根签发者不在 `TRUSTED_ROOT_ISSUERS` 中。
+- `UNTRUSTED_ROOT`：根签发者不在本次校验使用的信任根集合中（激活版本 / 固定版本 / `TRUSTED_ROOT_ISSUERS`）。
 - `CYCLE`：父链成环，`relation=cycle_point` 定位环上节点。
 - `MAX_DEPTH_EXCEEDED`：链长超过 `MAX_CHAIN_DEPTH`（默认 256）。
 
@@ -157,7 +167,86 @@ curl "http://localhost:8080/verify/sha256:image?at=2026-09-22T08:00:00Z"
 - **`evaluated_at`**：传入 `at` 时响应附带该字段，为归一化后的 UTC 毫秒串（如 `2026-09-22T08:00:00.000Z`）；带偏移的输入（如 `+08:00`，需 URL 编码为 `%2B`）会归一化为 UTC。未传 `at` 时响应结构与之前完全一致，不含该字段。
 - **错误语义**：`at` 非法（非 RFC3339、缺时区偏移等）或**晚于当前时间**返回 `400`；该时点尚无目标制品的任何证明记录仍返回 `404`；其余状态码与失败路径语义与实时校验相同。
 
-### 3.3 撤销制品 `POST /revocations`
+#### 固定信任根版本 `?root_version=<name>`
+
+```bash
+# 未指定: 使用当前激活版本 (未配置版本时回退 TRUSTED_ROOT_ISSUERS)
+curl "http://localhost:8080/verify/sha256:image"
+
+# 固定到指定 (即使已不是当前激活) 版本: 结果只取决于该版本公钥集合
+curl "http://localhost:8080/verify/sha256:image?root_version=roots-2026-01"
+```
+
+- 未指定 `root_version` 时使用当前激活版本；**指定时固定使用该版本**，与版本是否仍处于激活状态无关，因此可对历史制品按其签发时的旧根重新校验。
+- 未知版本名返回 **`400`**（与 `at` 参数错误同一错误语义）；`root_version` 与 `at` 可组合使用。
+- 当校验使用了某个版本（激活或固定）时，响应额外附带：
+
+  ```json
+  { "trust_root": { "version": "roots-2026-01", "pinned": false, "active": true } }
+  ```
+
+  `pinned=true` 表示来自显式 `?root_version=`，`active` 表示该版本是否为当前激活版本。回退到 `TRUSTED_ROOT_ISSUERS` 环境变量时不附带该字段。
+
+### 3.3 信任根版本管理
+
+#### 创建版本 `POST /trust-roots`
+
+```json
+{
+  "name": "roots-2026-09",
+  "public_keys": ["<Base64 Ed25519 公钥 1>", "<Base64 Ed25519 公钥 2>"],
+  "description": "2026Q3 根密钥集合"
+}
+```
+
+- `name`：版本唯一名称（字母/数字及 `._-`，以字母或数字开头，最长 128）。重名返回 `409`；名称一经创建不可修改。
+- `public_keys`：Ed25519 公钥集合（Base64，每个 32 字节），**至少一个**；空白项忽略、重复项去重，去重后为空或存在非法公钥返回 `400`。
+- 版本**不可变**：创建后不提供更新/删除接口；轮换密钥请创建新版本再切换。
+- 新创建的版本不会自动生效，响应中 `"active": false`。
+
+```bash
+curl -X POST http://localhost:8080/trust-roots \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"roots-2026-09","public_keys":["MCowBQYDK2VwAyEA..."],"description":"2026Q3"}'
+```
+
+#### 列出版本 `GET /trust-roots`
+
+```json
+{
+  "status": "OK",
+  "active_version": "roots-2026-09",
+  "versions": [
+    {
+      "name": "roots-2026-01",
+      "description": "旧根集合",
+      "public_keys": ["..."],
+      "created_at": "2026-01-01T00:00:00.000Z",
+      "active": false
+    },
+    {
+      "name": "roots-2026-09",
+      "description": "2026Q3 根密钥集合",
+      "public_keys": ["...", "..."],
+      "created_at": "2026-09-01T00:00:00.000Z",
+      "active": true
+    }
+  ]
+}
+```
+
+尚未激活任何版本时 `active_version` 为 `null`（此期间校验回退到 `TRUSTED_ROOT_ISSUERS`）。
+
+#### 激活 / 切换版本 `PUT /trust-roots/{name}/activate`
+
+```bash
+curl -X PUT http://localhost:8080/trust-roots/roots-2026-09/activate
+```
+
+- 通过单行原子更新切换“当前版本”指针；重复激活同一版本安全且幂等。
+- 未知名称返回 `404`。切换对之后未指定 `root_version` 的校验立即整体生效，不存在新旧公钥混用的中间状态。
+
+### 3.4 撤销制品 `POST /revocations`
 
 ```json
 { "artifact_digest": "sha256:os", "reason": "CVE-2026-xxxx / 密钥泄露" }
@@ -165,7 +254,7 @@ curl "http://localhost:8080/verify/sha256:image?at=2026-09-22T08:00:00Z"
 
 撤销后，该制品及其**全部下游**校验都会失败（附完整失败路径）。撤销本身幂等、不可通过该接口删除。
 
-### 3.4 生成签名（客户端示例）
+### 3.5 生成签名（客户端示例）
 
 ```python
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -183,17 +272,19 @@ signature = sign(priv, "sha256:abc123", "sha256:def456")  # parent 为 None 表�
 3. 同一 `artifact_digest` 存在多条不同证明（issuer/parent/signature 任一不同）→ `FORK`。
 4. 用记录内 `issuer` 公钥对 canonical message 验签，失败 → `INVALID_SIGNATURE`。
 5. 沿 `parent_digest` 向上重复 2–4；父节点缺失 / 分叉 / 撤销 / 签名非法 / 成环均带有序失败路径返回。
-6. 到达根（`parent_digest` 为空）时，根 `issuer` 必须在信任根集合中，否则 `UNTRUSTED_ROOT`。
+6. 到达根（`parent_digest` 为空）时，根 `issuer` 必须在本次校验的信任根集合中：`?root_version=` 指定版本 → 该版本公钥集合；否则使用当前激活版本；均未配置时使用 `TRUSTED_ROOT_ISSUERS`（其为空则开发模式接受任意自签名根）。不在集合中 → `UNTRUSTED_ROOT`。
 
-传入 `?at=` 时，上述规则中的“存在记录”与“已撤销”均按该时点判定（`created_at <= at`、`revoked_at <= at`），规则本身与返回结构不变。
+传入 `?at=` 时，上述规则中的“存在记录”与“已撤销”均按该时点判定（`created_at <= at`、`revoked_at <= at`），规则本身与返回结构不变。信任根版本不做时点过滤：版本一经创建即为不可变事实，`?at=` 与 `?root_version=` 独立组合。
 
 ## 5. 环境变量
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `DATABASE_PATH` | `data/proofs.db`（容器内 `/data/proofs.db`） | SQLite 文件路径，容器内挂载命名卷 |
-| `TRUSTED_ROOT_ISSUERS` | 空（开发模式） | 受信任根公钥，Base64，逗号分隔 |
+| `DATABASE_PATH` | `data/proofs.db`（容器内 `/data/proofs.db`） | SQLite 文件路径，容器内挂载命名卷；信任根版本同库存放、随卷持久化 |
+| `TRUSTED_ROOT_ISSUERS` | 空（开发模式） | 初始受信任根公钥，Base64，逗号分隔；**仅在未激活任何信任根版本时作为回退**（显式指定 `?root_version=` 或存在激活版本时被版本集合取代） |
 | `MAX_CHAIN_DEPTH` | `256` | 单次校验最大遍历深度 |
+
+信任根版本数据保存在 SQLite 内（`trust_root_versions` / `trust_root_keys` / `trust_root_state` 三张表），无需额外环境变量；重建数据库卷会清空已创建的版本。
 
 ## 6. 运行测试
 
@@ -202,17 +293,17 @@ python3 -m pip install pytest httpx
 python3 -m pytest -q
 ```
 
-覆盖：合法链/根、签名往返、幂等写入与撤销、目标/祖先分叉、目标/祖先撤销定位、非法签名、缺失父节点、成环、非信任根，以及历史时点校验（非法/未来 `at` → 400、时点前 404、时间边界闭区间、`evaluated_at` 归一化、晚到分叉、晚到父证明、撤销前后）等 26 个用例。
+覆盖：合法链/根、签名往返、幂等写入与撤销、目标/祖先分叉、目标/祖先撤销定位、非法签名、缺失父节点、成环、非信任根、历史时点校验（非法/未来 `at` → 400、时点前 404、时间边界闭区间、`evaluated_at` 归一化、晚到分叉、晚到父证明、撤销前后），以及信任根版本（创建校验/重名 409、非法/空公钥 400、列表与激活状态、原子切换与幂等激活、激活版本与固定版本校验、未知版本 400、`root_version` × `at` 组合、无版本时回退 `TRUSTED_ROOT_ISSUERS`、切换/校验并发下只能读到完整公钥集合）等共 45 个用例。
 
 ## 7. 目录结构
 
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由
+│   ├── main.py        # FastAPI 路由 (含信任根版本接口与 ?root_version)
 │   ├── verifier.py    # 递归校验 / 分叉 / 撤销 / 失败路径 / 历史时点求值
 │   ├── crypto.py      # Ed25519 与规范化签名载荷
-│   ├── database.py    # SQLite 表结构与查询 (含时点过滤)
+│   ├── database.py    # SQLite 表结构与查询 (含时点过滤、信任根版本事务)
 │   ├── timeutil.py    # RFC3339 解析与 UTC 毫秒格式化
 │   ├── config.py      # 环境变量配置
 │   └── schemas.py     # Pydantic 模型

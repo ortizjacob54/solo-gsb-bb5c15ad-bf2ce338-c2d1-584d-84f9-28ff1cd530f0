@@ -1,6 +1,7 @@
 """FastAPI 入口: 记录写入 / 制品校验 / 撤销 / 查询接口。"""
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -11,13 +12,28 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from . import crypto
 from .config import settings
 from .database import (
+    activate_trust_root_version,
+    create_trust_root_version,
+    fetch_active_trust_root,
     fetch_proofs,
     fetch_revocation,
+    fetch_trust_root_version_by_name,
     get_connection,
     init_db,
+    list_trust_root_versions,
     row_to_dict,
 )
-from .schemas import GenericMessage, ProofIn, RevokeIn, RevokeResponse, WriteProofResponse
+from .schemas import (
+    GenericMessage,
+    ProofIn,
+    RevokeIn,
+    RevokeResponse,
+    TrustRootActivateResponse,
+    TrustRootCreateResponse,
+    TrustRootIn,
+    TrustRootListResponse,
+    WriteProofResponse,
+)
 from .timeutil import parse_rfc3339_utc
 from .verifier import verify_artifact
 
@@ -147,6 +163,14 @@ def verify(
             "响应附带 evaluated_at。"
         ),
     ),
+    root_version: str | None = Query(
+        default=None,
+        description=(
+            "固定使用指定名称的信任根版本校验; 未知版本返回 400。"
+            "不传时使用当前激活版本; 尚未配置任何版本时回退到 "
+            "TRUSTED_ROOT_ISSUERS 环境变量行为。"
+        ),
+    ),
     conn: sqlite3.Connection = Depends(db),
 ) -> dict[str, Any]:
     at_dt: datetime | None = None
@@ -159,9 +183,38 @@ def verify(
             raise HTTPException(
                 status_code=400, detail="at 晚于当前时间, 无法对未来时点求值"
             )
-    result = verify_artifact(conn, artifact_digest, settings, at=at_dt)
+
+    # 解析本次校验使用的信任根集合:
+    # 指定 root_version -> 固定该版本 (未知 -> 400);
+    # 未指定 -> 当前激活版本; 无激活版本 -> 环境变量 TRUSTED_ROOT_ISSUERS。
+    cfg = settings
+    trust_meta: dict[str, Any] | None = None
+    if root_version is not None:
+        version = fetch_trust_root_version_by_name(conn, root_version.strip())
+        if version is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"未知的信任根版本: {root_version!r}",
+            )
+        cfg = dataclasses.replace(
+            settings, trusted_root_issuers=frozenset(version["public_keys"])
+        )
+        trust_meta = {
+            "version": version["name"],
+            "pinned": True,
+            "active": version["active"],
+        }
+    else:
+        active_name, active_keys = fetch_active_trust_root(conn)
+        if active_name is not None:
+            cfg = dataclasses.replace(settings, trusted_root_issuers=active_keys)
+            trust_meta = {"version": active_name, "pinned": False, "active": True}
+
+    result = verify_artifact(conn, artifact_digest, cfg, at=at_dt)
     if result["status"] == "NOT_FOUND":
         raise HTTPException(status_code=404, detail=result["failure"]["detail"])
+    if trust_meta is not None:
+        result["trust_root"] = trust_meta
     return result
 
 
@@ -224,3 +277,72 @@ def get_revocation(
     if not row:
         raise HTTPException(status_code=404, detail="该制品未被撤销")
     return GenericMessage(status="REVOKED", detail=row["reason"], proof=row)
+
+
+# ---------- 信任根版本 ----------
+
+
+@app.post(
+    "/trust-roots",
+    response_model=TrustRootCreateResponse,
+    status_code=201,
+    tags=["trust-roots"],
+    summary="创建不可变的信任根版本 (唯一名称 + Ed25519 公钥集合)",
+)
+def create_trust_root(
+    payload: TrustRootIn, conn: sqlite3.Connection = Depends(db)
+) -> dict[str, Any]:
+    if not payload.public_keys:
+        raise HTTPException(
+            status_code=400, detail="public_keys 至少包含一个非空的 Ed25519 公钥"
+        )
+    # 提前校验公钥格式, 不合法的版本拒绝入库。
+    for key in payload.public_keys:
+        try:
+            crypto.decode_public_key(key)
+        except (crypto.KeyDecodeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400, detail=f"公钥非法 ({key[:16]}...): {exc}"
+            ) from exc
+
+    try:
+        version = create_trust_root_version(
+            conn,
+            name=payload.name,
+            public_keys=payload.public_keys,
+            description=payload.description,
+        )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(
+            status_code=409, detail=f"信任根版本 {payload.name!r} 已存在"
+        ) from exc
+    return {"status": "CREATED", "version": version}
+
+
+@app.get(
+    "/trust-roots",
+    response_model=TrustRootListResponse,
+    tags=["trust-roots"],
+    summary="列出全部信任根版本及其激活状态",
+)
+def list_trust_roots(conn: sqlite3.Connection = Depends(db)) -> dict[str, Any]:
+    versions = list_trust_root_versions(conn)
+    active = next((v["name"] for v in versions if v["active"]), None)
+    return {"status": "OK", "active_version": active, "versions": versions}
+
+
+@app.put(
+    "/trust-roots/{name}/activate",
+    response_model=TrustRootActivateResponse,
+    tags=["trust-roots"],
+    summary="原子切换当前激活的信任根版本",
+)
+def activate_trust_root(
+    name: str, conn: sqlite3.Connection = Depends(db)
+) -> dict[str, Any]:
+    if not activate_trust_root_version(conn, name.strip()):
+        raise HTTPException(
+            status_code=404, detail=f"信任根版本 {name!r} 不存在"
+        )
+    version = fetch_trust_root_version_by_name(conn, name.strip())
+    return {"status": "ACTIVATED", "active_version": version}

@@ -3,6 +3,9 @@ FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     DATABASE_PATH=/data/proofs.db
+# 证明记录、撤销记录与信任根版本均存放在 $DATABASE_PATH,
+# 通过下方命名卷 (/data) 持久化; 未配置信任根版本时回退到
+# TRUSTED_ROOT_ISSUERS 环境变量 (留空 = 开发模式)。
 
 WORKDIR /app
 
