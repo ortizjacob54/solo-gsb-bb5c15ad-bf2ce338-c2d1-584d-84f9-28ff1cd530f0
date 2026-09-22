@@ -8,8 +8,10 @@
 5. 沿 parent_digest 向上:
    - 父节点缺失 / 分叉 / 被撤销 / 签名非法 / 成环 / 非信任根,
      全部带上可定位的有序失败路径返回。
-6. 根记录 (parent_digest 为空) 的 issuer 必须属于信任根集合;
-   未配置 TRUSTED_ROOT_ISSUERS 时退化为“任意自签名根均可接受”(仅建议开发环境使用)。
+6. 根记录 (parent_digest 为空) 的 issuer 必须属于信任根集合
+   (cfg.trusted_root_issuers); 该集合由入口解析: 可来自指定/激活的
+   信任根版本 (见 /trust-roots) 或 TRUSTED_ROOT_ISSUERS,
+   集合为空时退化为“任意自签名根均可接受”(仅建议开发环境使用)。
 
 历史时点校验 (at 参数):
 - 只读取 created_at <= at 的证明记录, 仅 revoked_at <= at 的撤销视为生效;

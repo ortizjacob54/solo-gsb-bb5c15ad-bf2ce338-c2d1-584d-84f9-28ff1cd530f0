@@ -11,6 +11,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
+# 启动时 (app.main lifespan -> init_db) 自动建表/迁移:
+# proofs、revocations 以及信任根版本表 (trust_root_*)，
+# 在已挂载的旧数据卷上使用 CREATE TABLE IF NOT EXISTS 平滑升级。
 RUN mkdir -p /data && useradd -r -u 10001 appuser && chown -R appuser /data
 USER appuser
 

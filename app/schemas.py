@@ -63,3 +63,65 @@ class GenericMessage(BaseModel):
     proof: dict[str, Any] | None = None
     proofs: list[dict[str, Any]] | None = None
     revocations: list[dict[str, Any]] | None = None
+
+
+# ---------- 信任根版本 ----------
+
+
+class TrustRootIn(BaseModel):
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description=(
+            "版本唯一名称, 字母/数字/._- 组成, 用于 URL 与固定引用"
+            " (?root_version=)"
+        ),
+    )
+    public_keys: list[str] = Field(
+        ...,
+        min_length=1,
+        description="该版本信任的 Ed25519 公钥集合 (Base64), 至少一个",
+    )
+    description: str = Field("", max_length=2048, description="版本说明")
+
+    @field_validator("name")
+    @classmethod
+    def _strip_name(cls, v: str) -> str:
+        return v.strip()
+
+    @field_validator("description")
+    @classmethod
+    def _strip_description(cls, v: str) -> str:
+        return v.strip()
+
+    @field_validator("public_keys")
+    @classmethod
+    def _normalize_keys(cls, values: list[str]) -> list[str]:
+        cleaned = [v.strip() for v in values if v is not None and v.strip()]
+        if not cleaned:
+            raise ValueError("public_keys 至少需要一个公钥")
+        # 去重但保留首次出现顺序。
+        seen: set[str] = set()
+        unique: list[str] = []
+        for key in cleaned:
+            if key not in seen:
+                seen.add(key)
+                unique.append(key)
+        return unique
+
+
+class TrustRootResponse(BaseModel):
+    name: str
+    description: str
+    public_keys: list[str]
+    created_at: str
+    is_active: bool = False
+    activated_at: str | None = None
+
+
+class TrustRootListResponse(BaseModel):
+    status: str
+    active_version: str | None = None
+    effective_source: str
+    trust_roots: list[TrustRootResponse]
